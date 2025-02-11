@@ -40,4 +40,4 @@ python app.py
 '''
 
 ## Testing the APIs
-executes testApis.ipynb after executing app.py
+executes testAPIs.ipynb after executing app.py
