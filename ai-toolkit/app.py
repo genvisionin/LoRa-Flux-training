@@ -216,7 +216,6 @@ def generate_caption(image_path: str) -> str:
         )
         
         caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        
         torch.cuda.empty_cache()
         
         return caption_text
@@ -227,11 +226,20 @@ def generate_caption(image_path: str) -> str:
 
 def prepare_training_data(image_paths: List[str], save_dir: str):
     os.makedirs(save_dir, exist_ok=True)
+    config_path = "config/train_lora_flux.yaml"
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    trigger_word = config.get('config', {}).get('process', [{}])[0].get('trigger_word', '')
+
+    
     for img_path in image_paths:
         filename = Path(img_path).name
         new_img_path = os.path.join(save_dir, filename)
         shutil.copy2(img_path, new_img_path)
         caption = generate_caption(img_path)
+        if trigger_word and f"[{trigger_word}]" not in caption:
+            caption = f"[{trigger_word}] {caption}"
+            
         txt_path = os.path.join(save_dir, Path(filename).stem + '.txt')
         with open(txt_path, 'w') as f:
             f.write(caption)
