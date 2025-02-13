@@ -1,6 +1,6 @@
 import boto3
 import sagemaker
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException,Form
 from typing import List
 import os
 import torch
@@ -11,6 +11,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import asyncio
+from asyncio import StreamReader
+import signal
 from dotenv import load_dotenv
 import re
 import time
@@ -216,8 +218,9 @@ def generate_caption(image_path: str) -> str:
         )
         
         caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        torch.cuda.empty_cache()
         
+            
+        torch.cuda.empty_cache()
         return caption_text
     
     except Exception as e:
@@ -229,7 +232,7 @@ def prepare_training_data(image_paths: List[str], save_dir: str):
     config_path = "config/train_lora_flux.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-    trigger_word = config.get('config', {}).get('process', [{}])[0].get('trigger_word', '')
+    trigger_word = config.get('config', {}).get('trigger_word', '')
 
     
     for img_path in image_paths:
@@ -237,18 +240,33 @@ def prepare_training_data(image_paths: List[str], save_dir: str):
         new_img_path = os.path.join(save_dir, filename)
         shutil.copy2(img_path, new_img_path)
         caption = generate_caption(img_path)
-        if trigger_word and f"[{trigger_word}]" not in caption:
-            caption = f"[{trigger_word}] {caption}"
+
+        clean_caption = caption.replace(f"[{trigger_word}]", "").strip()
+        formatted_caption = f"[{trigger_word}] {clean_caption}" if trigger_word else clean_caption
+        
+        
             
         txt_path = os.path.join(save_dir, Path(filename).stem + '.txt')
         with open(txt_path, 'w') as f:
-            f.write(caption)
+            f.write(formatted_caption)
 
-def update_yaml_config(training_data_path: str):
+def update_yaml_config(training_data_path: str, trigger_word: str, training_steps: int):
     config_path = "config/train_lora_flux.yaml"
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config_content = f.read()
+
+    config_content = config_content.replace('${trigger_word}', trigger_word)
+    config = yaml.safe_load(config_content)
+
+    config['config']['name'] = trigger_word
     config['config']['process'][0]['datasets'][0]['folder_path'] = training_data_path
+    config['config']['trigger_word'] = trigger_word
+    config['config']['training_folder'] = f"output/{trigger_word}"
+
+    config['config']['process'][0]['train']['steps'] = training_steps
+    
+
+    
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
 
@@ -302,7 +320,14 @@ def parse_training_output(line: str, training_state: TrainingProgress):
         training_state.training_details['debug_logs'].append(error_msg)
 
 
-
+async def read_stream(stream: StreamReader, callback) -> None:
+    """Read from stream line by line until EOF, calling callback for each line"""
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        callback(line.decode().strip())
+        
 async def run_training(config_path: str):
     training_state.status = "training"
     training_state.current_progress = 0
@@ -314,47 +339,45 @@ async def run_training(config_path: str):
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         
-        # Safely extract configuration values
         training_folder = config.get('config', {}).get('training_folder', 'output/fieldpics')
         project_name = config.get('config', {}).get('name', 'unnamed_project')
         
+        # Create process with managed subprocess
         process = await asyncio.create_subprocess_shell(
             f"python run.py {config_path}", 
             stdout=asyncio.subprocess.PIPE, 
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setsid,  # Create new process group
+            limit=1024*1024*8  
         )
         
-        # Enhanced logging and progress tracking
-        while True:
-            if process.stdout.at_eof():
-                break
-                
-            try:
-                stdout_line = await process.stdout.readline()
-                if stdout_line:
-                    line = stdout_line.decode().strip()
-                    print(line)  # For debugging
-                    
-                    # Update training state based on output
-                    parse_training_output(line, training_state)
-                    
-                    # Update training duration
-                    if training_state.training_details['start_time']:
-                        training_state.training_details['training_duration'] = (
-                            time.time() - training_state.training_details['start_time']
-                        )
-                        
-            except Exception as e:
-                print(f"Error parsing training output: {str(e)}")
-                training_state.training_details['debug_logs'].append(f"Error: {str(e)}")
+        # Setup concurrent stream readers
+        stdout_reader = asyncio.create_task(
+            read_stream(process.stdout, lambda line: parse_training_output(line, training_state))
+        )
+        stderr_reader = asyncio.create_task(
+            read_stream(process.stderr, lambda line: print(f"Error: {line}"))
+        )
         
-        # Wait for process to complete
-        await process.wait()
+        # Wait for process and stream readers to complete
+        try:
+            await asyncio.gather(
+                process.wait(),
+                stdout_reader,
+                stderr_reader
+            )
+        except asyncio.CancelledError:
+            # Ensure clean process termination
+            if process.returncode is None:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            raise
         
         if process.returncode != 0:
-            stderr = await process.stderr.read()
-            error_msg = stderr.decode().strip()
-            raise Exception(f"Training failed with error: {error_msg}")
+            raise Exception(f"Training failed with return code {process.returncode}")
         
         # Find and upload latest model file
         latest_model = None
@@ -399,9 +422,23 @@ async def run_training(config_path: str):
         print(f"Training error: {str(e)}")
         import traceback
         traceback.print_exc()
+    finally:
+        # Ensure memory cleanup
+        if 'process' in locals():
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except:
+                pass
+        torch.cuda.empty_cache()
 
 @app.post("/upload-images")
-async def upload_images(images: List[UploadFile] = File(...)):
+async def upload_images(images: List[UploadFile] = File(...), trigger_word: str = Form(...),training_steps: int = Form(2000)):
+
+    if training_steps<=0:
+        raise HTTPException(
+            status_code=400,
+            detail="Training steps must be a positive integer"
+        )
     temp_dir = "temp_uploads"
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -415,10 +452,16 @@ async def upload_images(images: List[UploadFile] = File(...)):
         
         training_dir = "training_data"
         prepare_training_data(image_paths, training_dir)
-        update_yaml_config(training_dir)
+        update_yaml_config(training_dir,trigger_word,training_steps)
         config_path = "config/train_lora_flux.yaml"
         asyncio.create_task(run_training(config_path))
-        return {"message": "Upload successful, training started"}
+        return {"message": "Upload successful, training started",
+                "configuration":{
+                    "trigger_word": trigger_word,
+                    "training_steps": training_steps,
+                    "number_of_images": len(image_paths)
+                }
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
