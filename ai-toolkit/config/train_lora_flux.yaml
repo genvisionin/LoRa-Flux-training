@@ -1,5 +1,5 @@
 config:
-  name: Handbag2
+  name: ${trigger_word}
   process:
   - datasets:
     - cache_latents_to_disk: true
@@ -20,19 +20,6 @@ config:
       linear_alpha: 16
       type: lora
     performance_log_every: 1000
-    #sample:
-      #guidance_scale: 1
-      #height: 1024
-      #neg: ''
-      #prompts:
-      #- prompt1
-      #- prompt2
-      #sample_every: 200
-      #sample_steps: 4
-      #sampler: flowmatch
-      #seed: 42
-      #walk_seed: true
-      #width: 1024
     save:
       dtype: float16
       max_step_saves_to_keep: 4
@@ -52,11 +39,10 @@ config:
       steps: 2000
       train_text_encoder: false
       train_unet: true
-    training_folder: output/Handbag_fashion
-    trigger_word: H-1
+    training_folder: output/${trigger_word}
+    trigger_word: ${trigger_word}
     type: sd_trainer
 job: extension
 meta:
   name: '[name]'
   version: '1.0'
-
