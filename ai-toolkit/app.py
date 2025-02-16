@@ -23,6 +23,8 @@ load_dotenv()
 
 app = FastAPI()
 
+# nothing
+
 class TrainingProgress:
     def __init__(self):
         self.current_progress = 0.0
