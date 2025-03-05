@@ -23,8 +23,6 @@ load_dotenv()
 
 app = FastAPI()
 
-# nothing
-
 class TrainingProgress:
     def __init__(self):
         self.current_progress = 0.0
@@ -202,7 +200,7 @@ def generate_caption(image_path: str) -> str:
         )
         
         image = Image.open(image_path).convert("RGB")
-        prompt = "<DETAILED_CAPTION>"
+        prompt ="<DETAILED_CAPTION>"
         
         inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch_dtype)
         
